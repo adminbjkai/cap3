@@ -24,6 +24,12 @@
   --danger-text: #b91c1c;
   --accent: #16a34a;
   --accent-strong: #15803d;
+  --success-bg: #f0fdf4;
+  --success-text: #15803d;
+  --success-border: #bcf0da;
+  --info-bg: #f0f9ff;
+  --info-text: #0369a1;
+  --info-border: #bae6fd;
   color-scheme: light;
 }
 
@@ -49,6 +55,12 @@
   --danger-text: #fecaca;
   --accent: #22c55e;
   --accent-strong: #16a34a;
+  --success-bg: #064e3b;
+  --success-text: #6ee7b7;
+  --success-border: #065f46;
+  --info-bg: #082f49;
+  --info-text: #7dd3fc;
+  --info-border: #0c4a6e;
   color-scheme: dark;
 }
 
@@ -115,6 +127,30 @@ a {
 
   .status-chip-compact {
     @apply px-2.5 py-0.5 text-[10px] tracking-[0.08em];
+  }
+
+  .status-chip-success {
+    background: var(--success-bg);
+    color: var(--success-text);
+    border-color: var(--success-border);
+  }
+
+  .status-chip-info {
+    background: var(--info-bg);
+    color: var(--info-text);
+    border-color: var(--info-border);
+  }
+
+  .status-chip-warning {
+    background: var(--warning-bg);
+    color: var(--warning-text);
+    border-color: var(--border-strong);
+  }
+
+  .status-chip-danger {
+    background: var(--danger-bg);
+    color: var(--danger-text);
+    border-color: var(--border-strong);
   }
 
   .action-group {

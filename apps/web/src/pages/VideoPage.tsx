@@ -1,12 +1,17 @@
-import { Link, useParams, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useCallback, useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import {
+  deleteVideo,
   getJobStatus,
+  getSystemProviderStatus,
   getVideoStatus,
   saveWatchEdits,
+  retryVideo,
   type JobStatusResponse,
+  type ProviderStatusResponse,
   type VideoStatusResponse
 } from "../lib/api";
+import { ConfirmationDialog } from "../components/ConfirmationDialog";
 import { upsertRecentSession } from "../lib/sessions";
 import { PlayerCard } from "../components/PlayerCard";
 import { SummaryCard } from "../components/SummaryCard";
@@ -103,6 +108,7 @@ function buildIdempotencyKey(): string {
 export function VideoPage() {
   const params = useParams<{ videoId: string }>();
   const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
   const videoId = params.videoId ?? "";
 
   const jobId = useMemo(() => {
@@ -114,8 +120,10 @@ export function VideoPage() {
 
   const [status, setStatus] = useState<VideoStatusResponse | null>(null);
   const [jobStatus, setJobStatus] = useState<JobStatusResponse | null>(null);
+  const [providerStatus, setProviderStatus] = useState<ProviderStatusResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [providerStatusError, setProviderStatusError] = useState<string | null>(null);
   const [consecutivePollFailures, setConsecutivePollFailures] = useState(0);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
   const [playbackTimeSeconds, setPlaybackTimeSeconds] = useState(0);
@@ -130,6 +138,17 @@ export function VideoPage() {
   const transcriptSegments = status?.transcript?.segments ?? [];
   const chapters = useMemo(() => deriveChapters(status?.aiOutput, transcriptSegments), [status?.aiOutput, transcriptSegments]);
   const displayTitle = status?.aiOutput?.title?.trim() || "Untitled recording";
+
+  const showRetryButton = useMemo(() => {
+    if (!status) return false;
+    return status.transcriptionStatus === "failed" || status.aiStatus === "failed";
+  }, [status]);
+
+  const [isRetrying, setIsRetrying] = useState(false);
+  const [retryMessage, setRetryMessage] = useState<string | null>(null);
+  const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!isTitleEditing) {
@@ -159,6 +178,18 @@ export function VideoPage() {
       setLastUpdatedAt(new Date().toISOString());
       setConsecutivePollFailures(0);
       setErrorMessage(null);
+      void getSystemProviderStatus()
+        .then((nextProviderStatus) => {
+          setProviderStatus(nextProviderStatus);
+          setProviderStatusError(null);
+        })
+        .catch((providerError) => {
+          setProviderStatusError(
+            providerError instanceof Error
+              ? `Provider status temporarily unavailable. (${providerError.message})`
+              : "Provider status temporarily unavailable."
+          );
+        });
 
       if (jobId !== null) {
         try {
@@ -181,11 +212,8 @@ export function VideoPage() {
       });
     } catch (error) {
       setConsecutivePollFailures((current) => current + 1);
-      setErrorMessage(
-        error instanceof Error
-          ? `Status temporarily unavailable. We'll keep retrying automatically. (${error.message})`
-          : "Status temporarily unavailable. We'll keep retrying automatically."
-      );
+      const message = error instanceof Error ? error.message : "Status temporarily unavailable.";
+      setErrorMessage(`Status temporarily unavailable. We'll keep retrying automatically. (${message})`);
     } finally {
       setLoading(false);
     }
@@ -207,6 +235,26 @@ export function VideoPage() {
       window.clearTimeout(timeout);
     };
   }, [videoId, status, refresh, consecutivePollFailures]);
+
+  const handleRetry = useCallback(async () => {
+    if (!videoId || isRetrying) return;
+    setIsRetrying(true);
+    setRetryMessage(null);
+    try {
+      const result = await retryVideo(videoId);
+      if (result.ok) {
+        setRetryMessage("Job queued for retry.");
+        await refresh();
+      } else {
+        setRetryMessage("Failed to queue retry.");
+      }
+    } catch (err) {
+      setRetryMessage(err instanceof Error ? err.message : "Retry request failed.");
+    } finally {
+      setIsRetrying(false);
+      window.setTimeout(() => setRetryMessage(null), 3000);
+    }
+  }, [videoId, isRetrying, refresh]);
 
   const saveTitle = useCallback(async (): Promise<void> => {
     const normalizedTitle = titleDraft.trim();
@@ -256,6 +304,20 @@ export function VideoPage() {
     }
   }, [videoId, refresh]);
 
+  const handleDelete = useCallback(async (): Promise<void> => {
+    if (!videoId || isDeleting) return;
+    setIsDeleting(true);
+    setDeleteError(null);
+    try {
+      await deleteVideo(videoId);
+      navigate("/", { replace: true });
+    } catch (error) {
+      setDeleteError(error instanceof Error ? error.message : "Unable to delete video.");
+    } finally {
+      setIsDeleting(false);
+    }
+  }, [videoId, isDeleting, navigate]);
+
   if (!videoId) {
     return (
       <div className="workspace-card">
@@ -266,6 +328,20 @@ export function VideoPage() {
 
   return (
     <div className="space-y-4">
+      <ConfirmationDialog
+        open={isDeleteDialogOpen}
+        title="Delete video?"
+        message={`Delete "${displayTitle}"? This removes it from the library and returns you to the home page.`}
+        confirmLabel="Delete video"
+        busy={isDeleting}
+        errorMessage={deleteError}
+        onCancel={() => {
+          if (isDeleting) return;
+          setIsDeleteDialogOpen(false);
+          setDeleteError(null);
+        }}
+        onConfirm={() => void handleDelete()}
+      />
       <section className="workspace-card p-4 sm:p-5">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="max-w-3xl space-y-1.5">
@@ -323,6 +399,16 @@ export function VideoPage() {
           <div className="action-group gap-2">
             <button
               type="button"
+              onClick={() => {
+                setDeleteError(null);
+                setIsDeleteDialogOpen(true);
+              }}
+              className="btn-secondary px-3 py-1.5 text-sm text-red-700"
+            >
+              Delete
+            </button>
+            <button
+              type="button"
               onClick={() => void refresh()}
               className="btn-secondary px-3 py-1.5 text-sm"
             >
@@ -345,6 +431,24 @@ export function VideoPage() {
           <span className={`status-chip status-chip-compact ${isAutoRefreshActive ? "" : "opacity-90"}`}>
             Live updates: {isAutoRefreshActive ? "Active" : "Stopped"}
           </span>
+          {showRetryButton && (
+            <button
+              type="button"
+              onClick={() => void handleRetry()}
+              disabled={isRetrying}
+              className="btn-primary px-3 py-1 flex items-center gap-1.5 text-xs animate-in fade-in slide-in-from-left-2 duration-300"
+            >
+              <svg className={`h-3 w-3 ${isRetrying ? "animate-spin" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+              {isRetrying ? "Retrying..." : "Retry Processing"}
+            </button>
+          )}
+          {retryMessage && (
+            <span className={`text-xs font-medium animate-in fade-in duration-300 ${retryMessage.includes("Failed") || retryMessage.includes("failed") ? "text-red-600" : "text-green-600"}`}>
+              {retryMessage}
+            </span>
+          )}
         </div>
         {jobStatus ? <p className="sr-only">Queue status: {jobStatus.status}</p> : null}
 
@@ -366,18 +470,16 @@ export function VideoPage() {
               <button
                 type="button"
                 onClick={() => setRailTab("transcript")}
-                className={`segment-btn ${
-                  railTab === "transcript" ? "segment-btn-active" : ""
-                }`}
+                className={`segment-btn ${railTab === "transcript" ? "segment-btn-active" : ""
+                  }`}
               >
                 Transcript
               </button>
               <button
                 type="button"
                 onClick={() => setRailTab("comments")}
-                className={`segment-btn ${
-                  railTab === "comments" ? "segment-btn-active" : ""
-                }`}
+                className={`segment-btn ${railTab === "comments" ? "segment-btn-active" : ""
+                  }`}
               >
                 Comments
               </button>
@@ -419,7 +521,14 @@ export function VideoPage() {
           chapters={chapters}
           onJumpToSeconds={requestSeek}
         />
-        <StatusPanel status={status} loading={loading} lastUpdatedAt={lastUpdatedAt} isAutoRefreshActive={isAutoRefreshActive} />
+        <StatusPanel
+          status={status}
+          loading={loading}
+          lastUpdatedAt={lastUpdatedAt}
+          isAutoRefreshActive={isAutoRefreshActive}
+          providerStatus={providerStatus}
+          providerStatusError={providerStatusError}
+        />
       </div>
     </div>
   );

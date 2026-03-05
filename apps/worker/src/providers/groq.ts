@@ -99,7 +99,11 @@ export async function summarizeWithGroq(args: {
 
     if (!response.ok) {
       const detail = (await response.text()).slice(0, 400);
-      throw new Error(`groq request failed (${response.status}): ${detail}`);
+      const error = new Error(`groq request failed (${response.status}): ${detail}`);
+      if (response.status === 401 || response.status === 403) {
+        (error as any).fatal = true;
+      }
+      throw error;
     }
 
     const payload = (await response.json()) as GroqChatCompletionResponse;

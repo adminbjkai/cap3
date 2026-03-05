@@ -26,7 +26,7 @@ export function formatEta(seconds: number | null): string {
 
 export function buildPublicObjectUrl(key: string): string {
   const endpoint = (import.meta.env.VITE_S3_PUBLIC_ENDPOINT as string | undefined);
-  const bucket = (import.meta.env.VITE_S3_BUCKET as string | undefined) ?? "cap-v2";
+  const bucket = (import.meta.env.VITE_S3_BUCKET as string | undefined) ?? "cap3";
   
   let base: string;
   if (endpoint && !endpoint.includes("localhost")) {

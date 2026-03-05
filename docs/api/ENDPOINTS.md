@@ -4,22 +4,25 @@
 - `GET /health` -> `200 {"ok": true}`
 
 ## Frontend Routes (apps/web)
-- `GET /` (Vite at `http://localhost:5173`) -> Home, global library view (server-backed) + secondary local cache
+- `GET /` (Docker-first via nginx at `http://localhost:8022`; optional Vite dev at `http://localhost:5173`) -> Home, global library view (server-backed) + secondary local cache
 - `GET /record` -> Recorder flow (screen + mic, preview, upload)
 - `GET /video/:videoId` -> Processing status, playback, transcript, AI summary
 
 ## Implemented (web-api)
 - `POST /api/videos`
+  - Required header: `Idempotency-Key`
   - Creates one `videos` row and one `uploads` row (`mode=singlepart`, `phase=pending`)
   - Response: `{ videoId, rawKey }`
 
 - `POST /api/uploads/signed`
+  - Required header: `Idempotency-Key`
   - Body: `{ videoId, contentType? }`
   - Returns single-part presigned PUT URL for `uploads.raw_key`
   - Updates `uploads.phase='uploading'`
   - Response: `{ videoId, rawKey, method: "PUT", putUrl, headers }`
 
 - `POST /api/uploads/complete`
+  - Required header: `Idempotency-Key`
   - Body: `{ videoId }`
   - Updates `uploads.phase='uploaded'`
   - Updates video processing to queued

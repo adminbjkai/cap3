@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { spawn } from "node:child_process";
 import Fastify from "fastify";
 import rawBody from "fastify-raw-body";
 import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
@@ -8,7 +9,7 @@ import { query, withTransaction } from "@cap/db";
 
 const env = getEnv();
 const app = Fastify({ logger: false });
-const uiPublicBucketBase = `${(process.env.S3_PUBLIC_ENDPOINT ?? "http://localhost:9000").replace(/\/$/, "")}/${process.env.S3_BUCKET ?? "cap-v2"}`;
+const uiPublicBucketBase = `${(process.env.S3_PUBLIC_ENDPOINT ?? "http://localhost:9000").replace(/\/$/, "")}/${process.env.S3_BUCKET ?? "cap3"}`;
 
 const PROCESSING_PHASE_RANK: Record<string, number> = {
   not_required: 0,
@@ -25,6 +26,16 @@ const PROCESSING_PHASE_RANK: Record<string, number> = {
 
 type JobType = "process_video" | "transcribe_video" | "generate_ai" | "cleanup_artifacts";
 
+type ProcessResponse = {
+  resultKey: string;
+  thumbnailKey: string;
+  durationSeconds?: number;
+  width?: number;
+  height?: number;
+  fps?: number | null;
+  hasAudio?: boolean;
+};
+
 type WebhookPayload = {
   jobId: string;
   videoId: string;
@@ -38,6 +49,29 @@ type WebhookPayload = {
     height?: number;
     fps?: number;
   };
+};
+
+type ProviderHealthState = "healthy" | "active" | "degraded" | "idle" | "unavailable";
+
+type ProviderStatusResponse = {
+  checkedAt: string;
+  providers: Array<{
+    key: "deepgram" | "groq";
+    label: string;
+    purpose: "transcription" | "ai";
+    state: ProviderHealthState;
+    configured: boolean;
+    baseUrl: string | null;
+    model: string | null;
+    lastSuccessAt: string | null;
+    lastJob: {
+      id: number;
+      videoId: string;
+      status: string;
+      updatedAt: string;
+      lastError: string | null;
+    } | null;
+  }>;
 };
 
 function log(fields: Record<string, unknown>) {
@@ -98,6 +132,306 @@ function keyPointsFromChapters(chapters: unknown): string[] {
 
 function sha256Hex(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+function configuredSecret(value: string | null | undefined): boolean {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function sanitizeProviderBaseUrl(value: string | null | undefined): string | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    return url.origin + url.pathname.replace(/\/$/, "");
+  } catch {
+    return value;
+  }
+}
+
+function deriveProviderHealthState(args: {
+  configured: boolean;
+  lastJobStatus: string | null;
+  lastJobError: string | null;
+  lastSuccessAt: string | null;
+}): ProviderHealthState {
+  if (!args.configured) return "unavailable";
+  if (args.lastJobStatus === "queued" || args.lastJobStatus === "leased" || args.lastJobStatus === "running") {
+    return "active";
+  }
+  if (args.lastJobStatus === "dead" || args.lastJobError) {
+    return "degraded";
+  }
+  if (args.lastSuccessAt) {
+    return "healthy";
+  }
+  return "idle";
+}
+
+async function getSystemProviderStatus(): Promise<ProviderStatusResponse> {
+  const [deepgramJobResult, groqJobResult, deepgramSuccessResult, groqSuccessResult] = await Promise.all([
+    query<{
+      id: number;
+      video_id: string;
+      status: string;
+      updated_at: string;
+      last_error: string | null;
+    }>(
+      env.DATABASE_URL,
+      `SELECT id, video_id, status, updated_at, last_error
+       FROM job_queue
+       WHERE job_type = 'transcribe_video'
+       ORDER BY updated_at DESC
+       LIMIT 1`
+    ),
+    query<{
+      id: number;
+      video_id: string;
+      status: string;
+      updated_at: string;
+      last_error: string | null;
+    }>(
+      env.DATABASE_URL,
+      `SELECT id, video_id, status, updated_at, last_error
+       FROM job_queue
+       WHERE job_type = 'generate_ai'
+       ORDER BY updated_at DESC
+       LIMIT 1`
+    ),
+    query<{ updated_at: string }>(
+      env.DATABASE_URL,
+      `SELECT updated_at
+       FROM transcripts
+       WHERE provider = 'deepgram'
+       ORDER BY updated_at DESC
+       LIMIT 1`
+    ),
+    query<{ updated_at: string }>(
+      env.DATABASE_URL,
+      `SELECT updated_at
+       FROM ai_outputs
+       WHERE provider = 'groq'
+       ORDER BY updated_at DESC
+       LIMIT 1`
+    )
+  ]);
+
+  const deepgramJob = deepgramJobResult.rows[0] ?? null;
+  const groqJob = groqJobResult.rows[0] ?? null;
+  const deepgramLastSuccessAt = deepgramSuccessResult.rows[0]?.updated_at ?? null;
+  const groqLastSuccessAt = groqSuccessResult.rows[0]?.updated_at ?? null;
+  const deepgramConfigured = configuredSecret(process.env.DEEPGRAM_API_KEY);
+  const groqConfigured = configuredSecret(process.env.GROQ_API_KEY);
+
+  return {
+    checkedAt: new Date().toISOString(),
+    providers: [
+      {
+        key: "deepgram",
+        label: "Deepgram",
+        purpose: "transcription",
+        configured: deepgramConfigured,
+        state: deriveProviderHealthState({
+          configured: deepgramConfigured,
+          lastJobStatus: deepgramJob?.status ?? null,
+          lastJobError: deepgramJob?.last_error ?? null,
+          lastSuccessAt: deepgramLastSuccessAt
+        }),
+        baseUrl: sanitizeProviderBaseUrl(process.env.DEEPGRAM_BASE_URL ?? env.DEEPGRAM_BASE_URL),
+        model: process.env.DEEPGRAM_MODEL ?? env.DEEPGRAM_MODEL,
+        lastSuccessAt: deepgramLastSuccessAt,
+        lastJob: deepgramJob
+          ? {
+            id: deepgramJob.id,
+            videoId: deepgramJob.video_id,
+            status: deepgramJob.status,
+            updatedAt: deepgramJob.updated_at,
+            lastError: deepgramJob.last_error
+          }
+          : null
+      },
+      {
+        key: "groq",
+        label: "Groq",
+        purpose: "ai",
+        configured: groqConfigured,
+        state: deriveProviderHealthState({
+          configured: groqConfigured,
+          lastJobStatus: groqJob?.status ?? null,
+          lastJobError: groqJob?.last_error ?? null,
+          lastSuccessAt: groqLastSuccessAt
+        }),
+        baseUrl: sanitizeProviderBaseUrl(process.env.GROQ_BASE_URL ?? env.GROQ_BASE_URL),
+        model: process.env.GROQ_MODEL ?? env.GROQ_MODEL,
+        lastSuccessAt: groqLastSuccessAt,
+        lastJob: groqJob
+          ? {
+            id: groqJob.id,
+            videoId: groqJob.video_id,
+            status: groqJob.status,
+            updatedAt: groqJob.updated_at,
+            lastError: groqJob.last_error
+          }
+          : null
+      }
+    ]
+  };
+}
+
+function requireIdempotencyKey(headers: Record<string, unknown>): string | null {
+  const raw = headers["idempotency-key"];
+  if (!raw || typeof raw !== "string") return null;
+  const key = raw.trim();
+  return key.length > 0 ? key : null;
+}
+
+type IdempotencyBeginResult =
+  | { kind: "proceed" }
+  | { kind: "cached"; statusCode: number; body: Record<string, unknown> }
+  | { kind: "conflict"; statusCode: 409; body: Record<string, unknown> };
+
+async function idempotencyBegin(args: {
+  client: { query: (text: string, params?: any[]) => Promise<{ rowCount: number; rows: any[] }> };
+  endpoint: string;
+  idempotencyKey: string;
+  requestHash: string;
+  ttlInterval: string;
+}): Promise<IdempotencyBeginResult> {
+  // Allow reuse after expiry (best-effort; there is no cleanup job yet).
+  await args.client.query(
+    `DELETE FROM idempotency_keys
+     WHERE endpoint = $1
+       AND idempotency_key = $2
+       AND expires_at < now()`,
+    [args.endpoint, args.idempotencyKey]
+  );
+
+  const inserted = await args.client.query(
+    `INSERT INTO idempotency_keys (endpoint, idempotency_key, request_hash, expires_at)
+     VALUES ($1, $2, $3, now() + $4::interval)
+     ON CONFLICT DO NOTHING
+     RETURNING endpoint`,
+    [args.endpoint, args.idempotencyKey, args.requestHash, args.ttlInterval]
+  );
+
+  if (inserted.rowCount > 0) return { kind: "proceed" };
+
+  const existing = await args.client.query(
+    `SELECT request_hash, status_code, response_body
+     FROM idempotency_keys
+     WHERE endpoint = $1 AND idempotency_key = $2`,
+    [args.endpoint, args.idempotencyKey]
+  );
+
+  if (existing.rowCount === 0) {
+    return { kind: "conflict", statusCode: 409, body: badRequest("Idempotency key collision") };
+  }
+
+  const row = existing.rows[0] as { request_hash?: string; status_code?: number | null; response_body?: unknown };
+  if (row.request_hash !== args.requestHash) {
+    return { kind: "conflict", statusCode: 409, body: badRequest("Idempotency key reuse with different request payload") };
+  }
+
+  if (typeof row.status_code === "number" && row.response_body && typeof row.response_body === "object") {
+    return { kind: "cached", statusCode: row.status_code, body: row.response_body as Record<string, unknown> };
+  }
+
+  return { kind: "conflict", statusCode: 409, body: badRequest("Duplicate request still in progress") };
+}
+
+async function idempotencyFinish(args: {
+  client: { query: (text: string, params?: any[]) => Promise<any> };
+  endpoint: string;
+  idempotencyKey: string;
+  statusCode: number;
+  body: Record<string, unknown>;
+}): Promise<void> {
+  await args.client.query(
+    `UPDATE idempotency_keys
+     SET status_code = $3,
+         response_body = $4::jsonb
+     WHERE endpoint = $1 AND idempotency_key = $2`,
+    [args.endpoint, args.idempotencyKey, args.statusCode, JSON.stringify(args.body)]
+  );
+}
+
+function getInternalS3ClientAndBucket() {
+  const endpoint = process.env.S3_ENDPOINT;
+  const region = process.env.S3_REGION ?? "us-east-1";
+  const accessKeyId = process.env.S3_ACCESS_KEY;
+  const secretAccessKey = process.env.S3_SECRET_KEY;
+  const bucket = process.env.S3_BUCKET;
+  const forcePathStyle = (process.env.S3_FORCE_PATH_STYLE ?? "true") === "true";
+
+  if (!endpoint || !accessKeyId || !secretAccessKey || !bucket) {
+    throw new Error("Missing S3 configuration: S3_ENDPOINT, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET");
+  }
+
+  const client = new S3Client({
+    endpoint,
+    region,
+    forcePathStyle,
+    credentials: { accessKeyId, secretAccessKey },
+    requestChecksumCalculation: "WHEN_REQUIRED",
+    responseChecksumValidation: "WHEN_REQUIRED"
+  });
+
+  return { client, bucket };
+}
+
+async function generateTestMp4Buffer(args: { seconds: number }): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const seconds = Math.max(1, Math.floor(args.seconds));
+    const child = spawn("ffmpeg", [
+      "-y",
+      "-f",
+      "lavfi",
+      "-i",
+      "testsrc=size=320x240:rate=25",
+      "-f",
+      "lavfi",
+      "-i",
+      "sine=frequency=1000:sample_rate=44100",
+      "-t",
+      String(seconds),
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+      // Required for piping MP4 to stdout.
+      "-movflags",
+      "frag_keyframe+empty_moov+default_base_moof",
+      "-f",
+      "mp4",
+      "pipe:1"
+    ]);
+
+    const chunks: Buffer[] = [];
+    let stderr = "";
+
+    child.stdout.on("data", (chunk) => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+
+    child.on("error", (err) => {
+      reject(new Error(`ffmpeg spawn error: ${err.message}`));
+    });
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve(Buffer.concat(chunks));
+      } else {
+        reject(new Error(`ffmpeg exited with code ${code}: ${stderr}`));
+      }
+    });
+  });
 }
 
 function encodeLibraryCursor(createdAtIso: string, id: string): string {
@@ -219,13 +553,22 @@ app.get("/health", async (_req, reply) => {
   }
 });
 
+app.get("/api/system/provider-status", async (_req, reply) => {
+  try {
+    return reply.send(await getSystemProviderStatus());
+  } catch (error) {
+    log({ event: "provider_status.unavailable", error: String(error) });
+    return reply.code(503).send({ ok: false, error: "Provider status unavailable" });
+  }
+});
+
 app.get("/", async (_req, reply) => {
   const html = `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Cap v2 Upload UI</title>
+  <title>Cap3 Upload UI</title>
   <style>
     body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:900px;margin:32px auto;padding:0 16px;color:#111}
     .card{border:1px solid #ddd;border-radius:10px;padding:16px}
@@ -237,7 +580,7 @@ app.get("/", async (_req, reply) => {
   </style>
 </head>
 <body>
-  <h1>Cap v2 Milestone 3 UI</h1>
+  <h1>Cap3 Milestone 3 UI</h1>
   <p class="muted">Runs Milestone 2 flow: create video, request signed PUT, upload file, complete upload, poll status.</p>
   <div class="card">
     <div class="row">
@@ -274,7 +617,7 @@ app.get("/", async (_req, reply) => {
     async function postJson(path, body) {
       const res = await fetch(path, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
         body: JSON.stringify(body)
       });
       if (!res.ok) throw new Error(path + " failed: " + res.status + " " + await res.text());
@@ -439,96 +782,181 @@ app.post<{ Body: { videoId: string; jobType: JobType; payload?: Record<string, u
 });
 
 app.post("/debug/smoke", async (_req, reply) => {
-  const videoInsert = await query<{ id: string }>(
-    env.DATABASE_URL,
-    `INSERT INTO videos (name, source_type) VALUES ('Smoke Test Video', 'web_mp4') RETURNING id`
-  );
-  const videoId = videoInsert.rows[0]!.id;
+  try {
+    const mp4 = await generateTestMp4Buffer({ seconds: 2 });
+    const { client: s3Client, bucket } = getInternalS3ClientAndBucket();
 
-  const enqueueResult = await query<{ id: number }>(
-    env.DATABASE_URL,
-    `INSERT INTO job_queue (video_id, job_type, status, priority, payload, max_attempts)
-     VALUES ($1::uuid, 'process_video', 'queued', 100, '{}'::jsonb, $2)
-     ON CONFLICT (video_id, job_type) WHERE status IN ('queued', 'leased', 'running')
-     DO UPDATE SET updated_at = now()
-     RETURNING id`,
-    [videoId, env.WORKER_MAX_ATTEMPTS]
-  );
-  const queueJobId = enqueueResult.rows[0]!.id;
+    const created = await withTransaction(env.DATABASE_URL, async (client) => {
+      const videoResult = await client.query<{ id: string }>(
+        `INSERT INTO videos (name, source_type) VALUES ('Smoke Test Video', 'web_mp4') RETURNING id`
+      );
+      const videoId = videoResult.rows[0]!.id;
+      const rawKey = `videos/${videoId}/raw/source.mp4`;
 
-  const mediaJobId = crypto.randomUUID();
-  const webhookUrl = `${env.WEB_API_BASE_URL}/api/webhooks/media-server/progress`;
+      await client.query(
+        `INSERT INTO uploads (video_id, mode, phase, raw_key)
+         VALUES ($1::uuid, 'singlepart', 'pending', $2)`,
+        [videoId, rawKey]
+      );
 
-  const processRes = await fetch(`${env.MEDIA_SERVER_BASE_URL}/video/process`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      jobId: mediaJobId,
-      videoId,
-      outputPresignedUrl: "https://example.invalid/output",
-      thumbnailPresignedUrl: "https://example.invalid/thumb",
-      webhookUrl
-    })
-  });
+      // Create a job row so we can include a real job id in the /process payload.
+      const jobResult = await client.query<{ id: number }>(
+        `INSERT INTO job_queue (video_id, job_type, status, priority, run_after, payload, max_attempts)
+         VALUES ($1::uuid, 'process_video', 'queued', 100, now(), '{}'::jsonb, $2)
+         RETURNING id`,
+        [videoId, env.WORKER_MAX_ATTEMPTS]
+      );
 
-  if (!processRes.ok) {
-    const text = await processRes.text();
-    return reply.code(500).send({ ok: false, error: "media-server call failed", details: text });
-  }
+      // Monotonic guard: only move to queued if earlier than queued.
+      await client.query(
+        `UPDATE videos
+         SET processing_phase = 'queued',
+             processing_phase_rank = 10,
+             processing_progress = GREATEST(processing_progress, 5),
+             updated_at = now()
+         WHERE id = $1::uuid
+           AND processing_phase_rank < 10`,
+        [videoId]
+      );
 
-  const timeoutMs = 15000;
-  const start = Date.now();
-  let finalVideoState: any = null;
-  let eventsCount = 0;
+      return { videoId, rawKey, jobId: Number(jobResult.rows[0]!.id) };
+    });
 
-  while (Date.now() - start < timeoutMs) {
-    const videoResult = await query(
-      env.DATABASE_URL,
-      `SELECT id, processing_phase, processing_phase_rank, processing_progress, completed_at, updated_at
-       FROM videos WHERE id = $1::uuid`,
-      [videoId]
+    await s3Client.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: created.rawKey,
+        Body: mp4,
+        ContentType: "video/mp4"
+      })
     );
 
-    const evResult = await query<{ count: string }>(
+    // Mark upload complete (debug path).
+    await query(
       env.DATABASE_URL,
-      `SELECT COUNT(*)::text as count FROM webhook_events WHERE video_id = $1::uuid`,
-      [videoId]
+      `UPDATE uploads
+       SET phase = 'uploaded', updated_at = now()
+       WHERE video_id = $1::uuid
+         AND phase IN ('pending', 'uploading', 'completing')`,
+      [created.videoId]
     );
 
-    finalVideoState = videoResult.rows[0] ?? null;
-    eventsCount = Number(evResult.rows[0]?.count ?? "0");
+    const webhookUrl = `${env.WEB_API_BASE_URL}/api/webhooks/media-server/progress`;
+    const processRes = await fetch(`${env.MEDIA_SERVER_BASE_URL}/process`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        videoId: created.videoId,
+        rawKey: created.rawKey,
+        jobId: String(created.jobId),
+        webhookUrl
+      })
+    });
 
-    if (finalVideoState?.processing_phase === "complete" && eventsCount >= 4) {
-      break;
+    if (!processRes.ok) {
+      const text = await processRes.text();
+      return reply.code(500).send({ ok: false, error: "media-server call failed", details: text });
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    const mediaJson = (await processRes.json()) as ProcessResponse;
+
+    // Finalize processing state with rank-based monotonic guard.
+    await withTransaction(env.DATABASE_URL, async (client) => {
+      await client.query(
+        `UPDATE videos
+         SET processing_phase = 'complete',
+             processing_phase_rank = 70,
+             processing_progress = 100,
+             result_key = $2,
+             thumbnail_key = $3,
+             duration_seconds = $4,
+             width = $5,
+             height = $6,
+             fps = COALESCE($7, fps),
+             error_message = NULL,
+             completed_at = COALESCE(completed_at, now()),
+             updated_at = now()
+         WHERE id = $1::uuid
+           AND processing_phase_rank < 70`,
+        [
+          created.videoId,
+          mediaJson.resultKey,
+          mediaJson.thumbnailKey,
+          mediaJson.durationSeconds ?? null,
+          mediaJson.width ?? null,
+          mediaJson.height ?? null,
+          mediaJson.fps ?? null
+        ]
+      );
+
+      // This debug path bypasses the worker; mark the synthetic job row as terminal for operator clarity.
+      await client.query(
+        `UPDATE job_queue
+         SET status = 'succeeded',
+             finished_at = now(),
+             locked_by = NULL,
+             locked_until = NULL,
+             lease_token = NULL,
+             updated_at = now()
+         WHERE id = $1
+           AND status IN ('queued', 'leased', 'running')`,
+        [created.jobId]
+      );
+    });
+
+    const finalVideoResult = await query(
+      env.DATABASE_URL,
+      `SELECT id, processing_phase, processing_phase_rank, processing_progress, result_key, thumbnail_key, error_message, completed_at, updated_at
+       FROM videos WHERE id = $1::uuid`,
+      [created.videoId]
+    );
+
+    const queueRow = await query(
+      env.DATABASE_URL,
+      `SELECT id, status, attempts, locked_by, locked_until, lease_token, last_error, updated_at
+       FROM job_queue WHERE id = $1`,
+      [created.jobId]
+    );
+
+    log({ event: "debug.smoke.complete", videoId: created.videoId, jobId: created.jobId });
+
+    return reply.send({
+      ok: true,
+      videoId: created.videoId,
+      rawKey: created.rawKey,
+      jobId: created.jobId,
+      webhookUrl,
+      media: mediaJson,
+      finalVideo: finalVideoResult.rows[0] ?? null,
+      queueJob: queueRow.rows[0] ?? null
+    });
+  } catch (error) {
+    log({ event: "debug.smoke.error", error: String(error) });
+    return reply.code(500).send({ ok: false, error: String(error) });
   }
-
-  const queueRow = await query(
-    env.DATABASE_URL,
-    `SELECT id, status, attempts, locked_by, locked_until, lease_token
-     FROM job_queue WHERE id = $1`,
-    [queueJobId]
-  );
-
-  log({ event: "debug.smoke.complete", videoId, jobId: mediaJobId, queuedJobId: queueJobId, webhookEvents: eventsCount });
-
-  return reply.send({
-    ok: true,
-    videoId,
-    mediaJobId,
-    queueJobId,
-    webhookEvents: eventsCount,
-    finalVideo: finalVideoState,
-    queueJob: queueRow.rows[0] ?? null
-  });
 });
 
 app.post<{ Body: { name?: string } }>("/api/videos", async (req, reply) => {
-  const name = req.body?.name ?? "Untitled Video";
+  const idempotencyKey = requireIdempotencyKey(req.headers as Record<string, unknown>);
+  if (!idempotencyKey) return reply.code(400).send(badRequest("Missing Idempotency-Key header"));
 
-  const created = await withTransaction(env.DATABASE_URL, async (client) => {
+  const name = String(req.body?.name ?? "Untitled Video").trim() || "Untitled Video";
+  const endpointKey = "/api/videos";
+  const requestHash = sha256Hex(JSON.stringify({ name }));
+
+  const result = await withTransaction(env.DATABASE_URL, async (client) => {
+    const begin = await idempotencyBegin({
+      client,
+      endpoint: endpointKey,
+      idempotencyKey,
+      requestHash,
+      ttlInterval: "24 hours"
+    });
+
+    if (begin.kind === "cached" || begin.kind === "conflict") {
+      return { statusCode: begin.statusCode, body: begin.body };
+    }
+
     const videoResult = await client.query<{ id: string }>(
       `INSERT INTO videos (name, source_type) VALUES ($1, 'web_mp4') RETURNING id`,
       [name]
@@ -543,95 +971,167 @@ app.post<{ Body: { name?: string } }>("/api/videos", async (req, reply) => {
       [videoId, rawKey]
     );
 
-    return { videoId, rawKey };
+    const body = { videoId, rawKey };
+    await idempotencyFinish({ client, endpoint: endpointKey, idempotencyKey, statusCode: 200, body });
+    return { statusCode: 200, body };
   });
 
-  return reply.send(created);
+  return reply.code(result.statusCode).send(result.body);
 });
 
 app.post<{ Body: { videoId: string; contentType?: string } }>("/api/uploads/signed", async (req, reply) => {
+  const idempotencyKey = requireIdempotencyKey(req.headers as Record<string, unknown>);
+  if (!idempotencyKey) return reply.code(400).send(badRequest("Missing Idempotency-Key header"));
+
   const videoId = req.body?.videoId;
   if (!videoId) return reply.code(400).send(badRequest("videoId is required"));
 
-  const uploadLookup = await query<{ raw_key: string }>(
-    env.DATABASE_URL,
-    `SELECT raw_key FROM uploads WHERE video_id = $1::uuid`,
-    [videoId]
-  );
-  if (uploadLookup.rowCount === 0) {
-    return reply.code(404).send({ ok: false, error: "Upload not found for videoId" });
-  }
-
-  const rawKey = uploadLookup.rows[0]!.raw_key;
-  const contentType = req.body?.contentType ?? "application/octet-stream";
-  const { client, bucket } = getS3ClientAndBucket();
-
-  const putCommand = new PutObjectCommand({
-    Bucket: bucket,
-    Key: rawKey,
-    ContentType: contentType
-  });
-  const putUrl = await getSignedUrl(client, putCommand, { expiresIn: 900 });
-
-  await query(
-    env.DATABASE_URL,
-    `UPDATE uploads SET phase = 'uploading', updated_at = now() WHERE video_id = $1::uuid`,
-    [videoId]
-  );
-
-  return reply.send({
-    videoId,
-    rawKey,
-    method: "PUT",
-    putUrl,
-    headers: { "Content-Type": contentType }
-  });
-});
-
-app.post<{ Body: { videoId: string } }>("/api/uploads/complete", async (req, reply) => {
-  const videoId = req.body?.videoId;
-  if (!videoId) return reply.code(400).send(badRequest("videoId is required"));
+  const contentType = String(req.body?.contentType ?? "application/octet-stream").trim() || "application/octet-stream";
+  const endpointKey = "/api/uploads/signed";
+  const requestHash = sha256Hex(JSON.stringify({ videoId, contentType }));
 
   const result = await withTransaction(env.DATABASE_URL, async (client) => {
-    const uploadResult = await client.query<{ raw_key: string }>(
+    const begin = await idempotencyBegin({
+      client,
+      endpoint: endpointKey,
+      idempotencyKey,
+      requestHash,
+      ttlInterval: "15 minutes"
+    });
+
+    if (begin.kind === "cached" || begin.kind === "conflict") {
+      return { statusCode: begin.statusCode, body: begin.body };
+    }
+
+    const uploadLookup = await client.query<{ raw_key: string }>(
+      `SELECT u.raw_key
+       FROM uploads u
+       INNER JOIN videos v ON v.id = u.video_id
+       WHERE u.video_id = $1::uuid
+         AND v.deleted_at IS NULL`,
+      [videoId]
+    );
+    if (uploadLookup.rowCount === 0) {
+      const body = { ok: false, error: "Upload not found for videoId" };
+      await idempotencyFinish({ client, endpoint: endpointKey, idempotencyKey, statusCode: 404, body });
+      return { statusCode: 404, body };
+    }
+
+    const rawKey = uploadLookup.rows[0]!.raw_key;
+    const { client: s3Client, bucket } = getS3ClientAndBucket();
+
+    const putCommand = new PutObjectCommand({
+      Bucket: bucket,
+      Key: rawKey,
+      ContentType: contentType
+    });
+    const putUrl = await getSignedUrl(s3Client, putCommand, { expiresIn: 900 });
+
+    await client.query(
       `UPDATE uploads
-       SET phase = 'uploaded', updated_at = now()
+       SET phase = 'uploading', updated_at = now()
        WHERE video_id = $1::uuid
-       RETURNING raw_key`,
+         AND phase IN ('pending', 'uploading', 'completing')`,
       [videoId]
     );
 
-    if (uploadResult.rowCount === 0) {
-      return null;
+    const body = {
+      videoId,
+      rawKey,
+      method: "PUT",
+      putUrl,
+      headers: { "Content-Type": contentType }
+    };
+    await idempotencyFinish({ client, endpoint: endpointKey, idempotencyKey, statusCode: 200, body });
+    return { statusCode: 200, body };
+  });
+
+  return reply.code(result.statusCode).send(result.body);
+});
+
+app.post<{ Body: { videoId: string } }>("/api/uploads/complete", async (req, reply) => {
+  const idempotencyKey = requireIdempotencyKey(req.headers as Record<string, unknown>);
+  if (!idempotencyKey) return reply.code(400).send(badRequest("Missing Idempotency-Key header"));
+
+  const videoId = req.body?.videoId;
+  if (!videoId) return reply.code(400).send(badRequest("videoId is required"));
+
+  const endpointKey = "/api/uploads/complete";
+  const requestHash = sha256Hex(JSON.stringify({ videoId }));
+
+  const result = await withTransaction(env.DATABASE_URL, async (client) => {
+    const begin = await idempotencyBegin({
+      client,
+      endpoint: endpointKey,
+      idempotencyKey,
+      requestHash,
+      ttlInterval: "24 hours"
+    });
+
+    if (begin.kind === "cached" || begin.kind === "conflict") {
+      return { statusCode: begin.statusCode, body: begin.body };
     }
 
+    const uploadRow = await client.query<{ raw_key: string; phase: string }>(
+      `SELECT u.raw_key, u.phase
+       FROM uploads u
+       INNER JOIN videos v ON v.id = u.video_id
+       WHERE u.video_id = $1::uuid
+         AND v.deleted_at IS NULL
+       FOR UPDATE`,
+      [videoId]
+    );
+
+    if (uploadRow.rowCount === 0) {
+      const body = { ok: false, error: "Upload not found for videoId" };
+      await idempotencyFinish({ client, endpoint: endpointKey, idempotencyKey, statusCode: 404, body });
+      return { statusCode: 404, body };
+    }
+
+    const rawKey = uploadRow.rows[0]!.raw_key;
+    const phase = String(uploadRow.rows[0]!.phase);
+    if (phase === "pending" || phase === "uploading" || phase === "completing") {
+      await client.query(
+        `UPDATE uploads
+         SET phase = 'uploaded', updated_at = now()
+         WHERE video_id = $1::uuid
+           AND phase IN ('pending', 'uploading', 'completing')`,
+        [videoId]
+      );
+    }
+
+    // Monotonic guard: only move to queued if earlier than queued.
     await client.query(
       `UPDATE videos
        SET processing_phase = 'queued',
            processing_phase_rank = 10,
-           processing_progress = 0,
+           processing_progress = GREATEST(processing_progress, 5),
            updated_at = now()
-       WHERE id = $1::uuid`,
+       WHERE id = $1::uuid
+         AND processing_phase_rank < 10`,
       [videoId]
     );
 
     const jobResult = await client.query<{ id: number }>(
       `INSERT INTO job_queue (video_id, job_type, status, priority, run_after, payload, max_attempts)
        VALUES ($1::uuid, 'process_video', 'queued', 100, now(), '{}'::jsonb, $2)
+       ON CONFLICT (video_id, job_type) WHERE status IN ('queued', 'leased', 'running')
+       DO UPDATE SET updated_at = now()
        RETURNING id`,
       [videoId, env.WORKER_MAX_ATTEMPTS]
     );
 
-    return {
+    const body = {
       videoId,
-      rawKey: uploadResult.rows[0]!.raw_key,
+      rawKey,
       jobId: Number(jobResult.rows[0]!.id),
       status: "uploaded"
     };
+    await idempotencyFinish({ client, endpoint: endpointKey, idempotencyKey, statusCode: 200, body });
+    return { statusCode: 200, body };
   });
 
-  if (!result) return reply.code(404).send({ ok: false, error: "Upload not found for videoId" });
-  return reply.send(result);
+  return reply.code(result.statusCode).send(result.body);
 });
 
 app.get<{ Querystring: { cursor?: string; limit?: string; sort?: string } }>("/api/library/videos", async (req, reply) => {
@@ -678,6 +1178,8 @@ app.get<{ Querystring: { cursor?: string; limit?: string; sort?: string } }>("/a
      FROM videos v
      LEFT JOIN ai_outputs ao ON ao.video_id = v.id
      WHERE
+       v.deleted_at IS NULL
+       AND
        ($1::timestamptz IS NULL OR (
          CASE WHEN $3::boolean THEN (v.created_at, v.id) > ($1::timestamptz, $2::uuid)
          ELSE (v.created_at, v.id) < ($1::timestamptz, $2::uuid)
@@ -780,7 +1282,8 @@ app.get<{ Params: { id: string } }>("/api/videos/:id/status", async (req, reply)
        ORDER BY id DESC
        LIMIT 1
      ) aj ON true
-     WHERE v.id = $1::uuid`,
+     WHERE v.id = $1::uuid
+       AND v.deleted_at IS NULL`,
     [videoId]
   );
 
@@ -804,22 +1307,22 @@ app.get<{ Params: { id: string } }>("/api/videos/:id/status", async (req, reply)
     aiErrorMessage: row.ai_dead_error,
     transcript: row.transcript_vtt_key
       ? {
-          provider: row.transcript_provider,
-          language: row.transcript_language,
-          vttKey: row.transcript_vtt_key,
-          text: transcriptText,
-          segments: Array.isArray(row.transcript_segments_json) ? row.transcript_segments_json : []
-        }
+        provider: row.transcript_provider,
+        language: row.transcript_language,
+        vttKey: row.transcript_vtt_key,
+        text: transcriptText,
+        segments: Array.isArray(row.transcript_segments_json) ? row.transcript_segments_json : []
+      }
       : null,
     aiOutput:
       row.ai_provider || row.ai_model || row.ai_title || row.ai_summary || keyPoints.length > 0
         ? {
-            provider: row.ai_provider,
-            model: row.ai_model,
-            title: row.ai_title,
-            summary: row.ai_summary,
-            keyPoints
-          }
+          provider: row.ai_provider,
+          model: row.ai_model,
+          title: row.ai_title,
+          summary: row.ai_summary,
+          keyPoints
+        }
         : null
   });
 });
@@ -875,7 +1378,13 @@ app.patch<{ Params: { id: string }; Body: { title?: string | null; transcriptTex
       return { statusCode: 409, body: badRequest("Duplicate request still in progress") };
     }
 
-    const videoLookup = await client.query<{ id: string }>(`SELECT id FROM videos WHERE id = $1::uuid`, [videoId]);
+    const videoLookup = await client.query<{ id: string }>(
+      `SELECT id
+       FROM videos
+       WHERE id = $1::uuid
+         AND deleted_at IS NULL`,
+      [videoId]
+    );
     if (videoLookup.rowCount === 0) {
       const body = { ok: false, error: "Video not found" };
       await client.query(
@@ -968,9 +1477,165 @@ app.post("/api/uploads/multipart/presign-part", async (_req, reply) => reply.cod
 app.post("/api/uploads/multipart/complete", async (_req, reply) => reply.code(501).send({ ok: false, error: "Not Implemented" }));
 app.post("/api/uploads/multipart/abort", async (_req, reply) => reply.code(501).send({ ok: false, error: "Not Implemented" }));
 app.get("/api/playlist", async (_req, reply) => reply.code(501).send({ ok: false, error: "Not Implemented" }));
-app.post("/api/videos/:videoId/retry-processing", async (_req, reply) => reply.code(501).send({ ok: false, error: "Not Implemented" }));
-app.post("/api/videos/:videoId/retry-transcription", async (_req, reply) => reply.code(501).send({ ok: false, error: "Not Implemented" }));
-app.post("/api/videos/:videoId/retry-ai", async (_req, reply) => reply.code(501).send({ ok: false, error: "Not Implemented" }));
+app.post<{ Params: { id: string } }>("/api/videos/:id/delete", async (req, reply) => {
+  const videoId = req.params.id;
+  const idempotencyKey = requireIdempotencyKey(req.headers as Record<string, unknown>);
+  if (!idempotencyKey) return reply.code(400).send(badRequest("Missing Idempotency-Key header"));
+
+  const endpointKey = `/api/videos/${videoId}/delete`;
+  const requestHash = sha256Hex(JSON.stringify({ videoId, action: "soft_delete" }));
+
+  const result = await withTransaction(env.DATABASE_URL, async (client) => {
+    const begin = await idempotencyBegin({
+      client,
+      endpoint: endpointKey,
+      idempotencyKey,
+      requestHash,
+      ttlInterval: "24 hours"
+    });
+
+    if (begin.kind === "cached" || begin.kind === "conflict") {
+      return { statusCode: begin.statusCode, body: begin.body };
+    }
+
+    const videoResult = await client.query<{ id: string; deleted_at: string | null }>(
+      `SELECT id, deleted_at
+       FROM videos
+       WHERE id = $1::uuid
+       FOR UPDATE`,
+      [videoId]
+    );
+
+    if (videoResult.rowCount === 0) {
+      const body = { ok: false, error: "Video not found" };
+      await idempotencyFinish({ client, endpoint: endpointKey, idempotencyKey, statusCode: 404, body });
+      return { statusCode: 404, body };
+    }
+
+    let deletedAt = videoResult.rows[0]!.deleted_at;
+    if (!deletedAt) {
+      const deleted = await client.query<{ deleted_at: string }>(
+        `UPDATE videos
+         SET deleted_at = now(),
+             updated_at = now()
+         WHERE id = $1::uuid
+         RETURNING deleted_at`,
+        [videoId]
+      );
+      deletedAt = deleted.rows[0]!.deleted_at;
+    }
+
+    const body = {
+      ok: true,
+      videoId,
+      deletedAt
+    };
+    await idempotencyFinish({ client, endpoint: endpointKey, idempotencyKey, statusCode: 200, body });
+    return { statusCode: 200, body };
+  });
+
+  return reply.code(result.statusCode).send(result.body);
+});
+app.post<{ Params: { id: string } }>("/api/videos/:id/retry", async (req, reply) => {
+  const videoId = req.params.id;
+  const idempotencyKey = req.headers["idempotency-key"];
+  if (!idempotencyKey || typeof idempotencyKey !== "string" || idempotencyKey.trim().length === 0) {
+    return reply.code(400).send(badRequest("Missing Idempotency-Key header"));
+  }
+
+  const endpointKey = `/api/videos/${videoId}/retry`;
+  const requestHash = sha256Hex(JSON.stringify({ videoId, action: "retry" }));
+
+  const result = await withTransaction(env.DATABASE_URL, async (client) => {
+    // 1. Idempotency Check
+    const idemp = await client.query(
+      `INSERT INTO idempotency_keys (endpoint, idempotency_key, request_hash, expires_at)
+       VALUES ($1, $2, $3, now() + interval '24 hours')
+       ON CONFLICT DO NOTHING
+       RETURNING endpoint, idempotency_key`,
+      [endpointKey, idempotencyKey, requestHash]
+    );
+
+    if (idemp.rowCount === 0) {
+      const existing = await client.query(
+        `SELECT request_hash, status_code, response_body
+         FROM idempotency_keys
+         WHERE endpoint = $1 AND idempotency_key = $2`,
+        [endpointKey, idempotencyKey]
+      );
+      if ((existing.rowCount ?? 0) > 0) {
+        const row = existing.rows[0];
+        if (row.request_hash !== requestHash) return { statusCode: 409, body: badRequest("Idempotency key reuse with different payload") };
+        if (row.status_code) return { statusCode: row.status_code, body: row.response_body };
+        return { statusCode: 409, body: badRequest("Duplicate request still in progress") };
+      }
+      return { statusCode: 409, body: badRequest("Idempotency key collision") };
+    }
+
+    // 2. Video existence
+    const videoResult = await client.query(
+      `SELECT id, transcription_status, ai_status
+       FROM videos
+       WHERE id = $1::uuid
+         AND deleted_at IS NULL
+       FOR UPDATE`,
+      [videoId]
+    );
+    if (videoResult.rowCount === 0) {
+      const body = { ok: false, error: "Video not found" };
+      await client.query(`UPDATE idempotency_keys SET status_code = 404, response_body = $3::jsonb WHERE endpoint = $1 AND idempotency_key = $2`, [endpointKey, idempotencyKey, JSON.stringify(body)]);
+      return { statusCode: 404, body };
+    }
+
+    const video = videoResult.rows[0];
+    const jobsReset: string[] = [];
+
+    // 3. Reset Transcription Job if failed/dead
+    if (["failed", "dead", "not_started"].includes(video.transcription_status) || video.transcription_status === "processing") {
+      const res = await client.query(
+        `UPDATE job_queue
+         SET status = 'queued',
+             attempts = 0,
+             run_after = now(),
+             last_error = NULL,
+             updated_at = now()
+         WHERE video_id = $1::uuid AND job_type = 'transcribe_video'
+           AND status IN ('failed', 'dead', 'running', 'leased')`,
+        [videoId]
+      );
+      if ((res.rowCount ?? 0) > 0) {
+        jobsReset.push("transcribe_video");
+        await client.query(`UPDATE videos SET transcription_status = 'queued', updated_at = now() WHERE id = $1::uuid`, [videoId]);
+      }
+    }
+
+    // 4. Reset AI Job if failed/dead
+    if (["failed", "dead", "not_started"].includes(video.ai_status) || video.ai_status === "processing") {
+      const res = await client.query(
+        `UPDATE job_queue
+         SET status = 'queued',
+             attempts = 0,
+             run_after = now(),
+             last_error = NULL,
+             updated_at = now()
+         WHERE video_id = $1::uuid AND job_type = 'generate_ai'
+           AND status IN ('failed', 'dead', 'running', 'leased')`,
+        [videoId]
+      );
+      if ((res.rowCount ?? 0) > 0) {
+        jobsReset.push("generate_ai");
+        await client.query(`UPDATE videos SET ai_status = 'queued', updated_at = now() WHERE id = $1::uuid`, [videoId]);
+      }
+    }
+
+    // 5. Success
+    const body = { ok: true, videoId, jobsReset };
+    await client.query(`UPDATE idempotency_keys SET status_code = 200, response_body = $3::jsonb WHERE endpoint = $1 AND idempotency_key = $2`, [endpointKey, idempotencyKey, JSON.stringify(body)]);
+    return { statusCode: 200, body };
+  });
+
+  return reply.code(result.statusCode).send(result.body);
+});
 
 app.post(
   "/api/webhooks/media-server/progress",

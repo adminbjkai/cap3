@@ -61,6 +61,12 @@ export type WatchEditsResponse = {
   };
 };
 
+export type DeleteVideoResponse = {
+  ok: boolean;
+  videoId: string;
+  deletedAt: string;
+};
+
 export type LibraryVideoCard = {
   videoId: string;
   displayTitle: string;
@@ -95,6 +101,27 @@ export type JobStatusResponse = {
   updated_at: string;
 };
 
+export type ProviderStatusResponse = {
+  checkedAt: string;
+  providers: Array<{
+    key: "deepgram" | "groq";
+    label: string;
+    purpose: "transcription" | "ai";
+    state: "healthy" | "active" | "degraded" | "idle" | "unavailable";
+    configured: boolean;
+    baseUrl: string | null;
+    model: string | null;
+    lastSuccessAt: string | null;
+    lastJob: {
+      id: number;
+      videoId: string;
+      status: string;
+      updatedAt: string;
+      lastError: string | null;
+    } | null;
+  }>;
+};
+
 async function parseJson<T>(res: Response): Promise<T> {
   if (!res.ok) {
     throw new Error(`${res.status} ${res.statusText}: ${await res.text()}`);
@@ -102,11 +129,18 @@ async function parseJson<T>(res: Response): Promise<T> {
   return (await res.json()) as T;
 }
 
+function newIdempotencyKey(prefix: string): string {
+  if (typeof window !== "undefined" && window.crypto?.randomUUID) {
+    return `${prefix}-${window.crypto.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+}
+
 export async function createVideo(name?: string): Promise<VideoCreateResponse> {
   return parseJson<VideoCreateResponse>(
     await fetch("/api/videos", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "Idempotency-Key": newIdempotencyKey("videos") },
       body: JSON.stringify(name ? { name } : {})
     })
   );
@@ -116,7 +150,7 @@ export async function requestSignedUpload(videoId: string, contentType: string):
   return parseJson<SignedUploadResponse>(
     await fetch("/api/uploads/signed", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "Idempotency-Key": newIdempotencyKey("upload-signed") },
       body: JSON.stringify({ videoId, contentType })
     })
   );
@@ -126,7 +160,7 @@ export async function completeUpload(videoId: string): Promise<CompleteUploadRes
   return parseJson<CompleteUploadResponse>(
     await fetch("/api/uploads/complete", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "Idempotency-Key": newIdempotencyKey("upload-complete") },
       body: JSON.stringify({ videoId })
     })
   );
@@ -138,6 +172,34 @@ export async function getVideoStatus(videoId: string): Promise<VideoStatusRespon
 
 export async function getJobStatus(jobId: number): Promise<JobStatusResponse> {
   return parseJson<JobStatusResponse>(await fetch(`/api/jobs/${jobId}`));
+}
+
+export async function retryVideo(videoId: string): Promise<{ ok: boolean; videoId: string; jobsReset: string[] }> {
+  return parseJson<{ ok: boolean; videoId: string; jobsReset: string[] }>(
+    await fetch(`/api/videos/${encodeURIComponent(videoId)}/retry`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": newIdempotencyKey("retry")
+      }
+    })
+  );
+}
+
+export async function deleteVideo(videoId: string): Promise<DeleteVideoResponse> {
+  return parseJson<DeleteVideoResponse>(
+    await fetch(`/api/videos/${encodeURIComponent(videoId)}/delete`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": newIdempotencyKey("delete-video")
+      }
+    })
+  );
+}
+
+export async function getSystemProviderStatus(): Promise<ProviderStatusResponse> {
+  return parseJson<ProviderStatusResponse>(await fetch("/api/system/provider-status"));
 }
 
 export async function saveWatchEdits(

@@ -1,6 +1,8 @@
 import { Link } from "react-router-dom";
 import { useEffect, useMemo, useState } from "react";
-import { getLibraryVideos, type LibraryVideoCard } from "../lib/api";
+import { deleteVideo, getLibraryVideos, getSystemProviderStatus, type LibraryVideoCard, type ProviderStatusResponse } from "../lib/api";
+import { ConfirmationDialog } from "../components/ConfirmationDialog";
+import { ProviderStatusPanel } from "../components/ProviderStatusPanel";
 import { buildPublicObjectUrl, formatDuration } from "../lib/format";
 import { loadRecentSessions } from "../lib/sessions";
 
@@ -10,6 +12,12 @@ export function HomePage() {
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loadingLibrary, setLoadingLibrary] = useState(false);
   const [libraryError, setLibraryError] = useState<string | null>(null);
+  const [providerStatus, setProviderStatus] = useState<ProviderStatusResponse | null>(null);
+  const [loadingProviderStatus, setLoadingProviderStatus] = useState(false);
+  const [providerStatusError, setProviderStatusError] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<LibraryVideoCard | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const phaseLabel = (phase?: string | null) => {
     const labels: Record<string, string> = {
       queued: "Queued",
@@ -26,21 +34,37 @@ export function HomePage() {
   };
   const dateLabel = (iso: string) => new Date(iso).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 
+  const refreshLibrary = async () => {
+    setLoadingLibrary(true);
+    setLibraryError(null);
+    try {
+      const response = await getLibraryVideos({ limit: 18, sort: "created_desc" });
+      setLibraryItems(response.items);
+      setNextCursor(response.nextCursor);
+    } catch (error) {
+      setLibraryError(error instanceof Error ? error.message : "Unable to load global library.");
+    } finally {
+      setLoadingLibrary(false);
+    }
+  };
+
   useEffect(() => {
-    const load = async () => {
-      setLoadingLibrary(true);
-      setLibraryError(null);
+    void refreshLibrary();
+  }, []);
+
+  useEffect(() => {
+    const loadProviderStatus = async () => {
+      setLoadingProviderStatus(true);
+      setProviderStatusError(null);
       try {
-        const response = await getLibraryVideos({ limit: 18, sort: "created_desc" });
-        setLibraryItems(response.items);
-        setNextCursor(response.nextCursor);
+        setProviderStatus(await getSystemProviderStatus());
       } catch (error) {
-        setLibraryError(error instanceof Error ? error.message : "Unable to load global library.");
+        setProviderStatusError(error instanceof Error ? error.message : "Unable to load provider status.");
       } finally {
-        setLoadingLibrary(false);
+        setLoadingProviderStatus(false);
       }
     };
-    void load();
+    void loadProviderStatus();
   }, []);
 
   const loadMore = async () => {
@@ -57,8 +81,37 @@ export function HomePage() {
     }
   };
 
+  const confirmDelete = async () => {
+    if (!deleteTarget || isDeleting) return;
+    setIsDeleting(true);
+    setDeleteError(null);
+    try {
+      await deleteVideo(deleteTarget.videoId);
+      setLibraryItems((current) => current.filter((item) => item.videoId !== deleteTarget.videoId));
+      setDeleteTarget(null);
+    } catch (error) {
+      setDeleteError(error instanceof Error ? error.message : "Unable to delete video.");
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
+      <ConfirmationDialog
+        open={Boolean(deleteTarget)}
+        title="Delete video?"
+        message={`Delete "${deleteTarget?.displayTitle ?? "this video"}"? This removes it from the library and hides it from all default views.`}
+        confirmLabel="Delete video"
+        busy={isDeleting}
+        errorMessage={deleteError}
+        onCancel={() => {
+          if (isDeleting) return;
+          setDeleteTarget(null);
+          setDeleteError(null);
+        }}
+        onConfirm={() => void confirmDelete()}
+      />
       <section className="workspace-card">
         <p className="workspace-label">Workspace</p>
         <h1 className="mt-1 text-2xl font-semibold tracking-tight">Record, process, and share</h1>
@@ -72,6 +125,8 @@ export function HomePage() {
         </div>
       </section>
 
+      <ProviderStatusPanel data={providerStatus} loading={loadingProviderStatus} errorMessage={providerStatusError} />
+
       <section className="workspace-card">
         <div className="flex items-center justify-between gap-3">
           <h2 className="text-base font-semibold">Library</h2>
@@ -80,15 +135,7 @@ export function HomePage() {
             onClick={() => {
               setNextCursor(null);
               setLibraryItems([]);
-              setLoadingLibrary(true);
-              setLibraryError(null);
-              void getLibraryVideos({ limit: 18, sort: "created_desc" })
-                .then((response) => {
-                  setLibraryItems(response.items);
-                  setNextCursor(response.nextCursor);
-                })
-                .catch((error) => setLibraryError(error instanceof Error ? error.message : "Unable to refresh library."))
-                .finally(() => setLoadingLibrary(false));
+              void refreshLibrary();
             }}
             className="btn-secondary px-3 py-1.5"
           >
@@ -135,9 +182,21 @@ export function HomePage() {
                     </div>
                   </div>
                 </div>
-                <div className="mt-3 flex items-center justify-between">
+                <div className="mt-3 flex items-center justify-between gap-2">
                   <span className="text-xs text-muted">{item.hasResult ? "Result ready" : "Processing"}</span>
-                  <Link to={`/video/${item.videoId}`} className="btn-secondary px-3 py-1.5 text-sm">Open</Link>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDeleteError(null);
+                        setDeleteTarget(item);
+                      }}
+                      className="btn-secondary px-3 py-1.5 text-sm text-red-700"
+                    >
+                      Delete
+                    </button>
+                    <Link to={`/video/${item.videoId}`} className="btn-secondary px-3 py-1.5 text-sm">Open</Link>
+                  </div>
                 </div>
               </li>
             ))}

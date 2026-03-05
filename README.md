@@ -1,7 +1,7 @@
-# Cap v2: Deterministic Single-Tenant Video Web App
+ # cap3: Deterministic Single-Tenant Video Web App
 
 ## Project Purpose
-Cap v2 is a greenfield, single-tenant video web application focused on reliable media workflows and public sharing by video ID.
+cap3 is a greenfield, single-tenant video web application focused on reliable media workflows and public sharing by video ID.
 
 This system has no authentication, no users, no organizations, and no workspace model. Every video is accessible via a public-by-ID share route.
 
@@ -96,21 +96,21 @@ The intended execution model is event-driven through DB state transitions:
 
 ## Milestone 2 (Canonical)
 ```bash
-cd /Users/m17/2026/gh_repo_tests/Cap_v2
+cd /Users/m17/2026/gh_repo_tests/cap3
 cp .env.example .env
 make down && make up && make reset-db
 until curl -fsS http://localhost:3000/health >/dev/null; do sleep 1; done
 for n in 1 2 3 4 5; do
-  VIDEO_JSON="$(curl -sS -X POST http://localhost:3000/api/videos -H 'Content-Type: application/json' -d '{}')"
+  VIDEO_JSON="$(curl -sS -X POST http://localhost:3000/api/videos -H 'Content-Type: application/json' -H \"Idempotency-Key: $(uuidgen)\" -d '{}')"
   VIDEO_ID="$(echo "$VIDEO_JSON" | jq -r '.videoId')"
-  SIGNED_JSON="$(curl -sS -X POST http://localhost:3000/api/uploads/signed -H 'Content-Type: application/json' -d "{\"videoId\":\"${VIDEO_ID}\",\"contentType\":\"video/mp4\"}")"
+  SIGNED_JSON="$(curl -sS -X POST http://localhost:3000/api/uploads/signed -H 'Content-Type: application/json' -H \"Idempotency-Key: $(uuidgen)\" -d "{\"videoId\":\"${VIDEO_ID}\",\"contentType\":\"video/mp4\"}")"
   PUT_URL="$(echo "$SIGNED_JSON" | jq -r '.putUrl')"
 
-  docker compose exec -T media-server sh -lc "ffmpeg -y -f lavfi -i testsrc=size=320x240:rate=25 -f lavfi -i sine=frequency=1000:sample_rate=44100 -t 2 -c:v libx264 -pix_fmt yuv420p -c:a aac /tmp/upload-${n}.mp4 >/dev/null 2>&1 && cat /tmp/upload-${n}.mp4" > "/tmp/capv2-upload-${n}.mp4"
+  docker compose exec -T media-server sh -lc "ffmpeg -y -f lavfi -i testsrc=size=320x240:rate=25 -f lavfi -i sine=frequency=1000:sample_rate=44100 -t 2 -c:v libx264 -pix_fmt yuv420p -c:a aac /tmp/upload-${n}.mp4 >/dev/null 2>&1 && cat /tmp/upload-${n}.mp4" > "/tmp/cap3-upload-${n}.mp4"
 
-  curl -sS -X PUT "$PUT_URL" -H 'Content-Type: video/mp4' --data-binary @"/tmp/capv2-upload-${n}.mp4" >/dev/null
+  curl -sS -X PUT "$PUT_URL" -H 'Content-Type: video/mp4' --data-binary @"/tmp/cap3-upload-${n}.mp4" >/dev/null
 
-  COMPLETE_JSON="$(curl -sS -X POST http://localhost:3000/api/uploads/complete -H 'Content-Type: application/json' -d "{\"videoId\":\"${VIDEO_ID}\"}")"
+  COMPLETE_JSON="$(curl -sS -X POST http://localhost:3000/api/uploads/complete -H 'Content-Type: application/json' -H \"Idempotency-Key: $(uuidgen)\" -d "{\"videoId\":\"${VIDEO_ID}\"}")"
 
   until [ "$(curl -sS "http://localhost:3000/api/videos/${VIDEO_ID}/status" | jq -r '.processingPhase')" = "complete" ]; do
     sleep 1
@@ -122,8 +122,8 @@ for n in 1 2 3 4 5; do
   RESULT_KEY="$(echo "$STATUS_JSON" | jq -r '.resultKey')"
   THUMB_KEY="$(echo "$STATUS_JSON" | jq -r '.thumbnailKey')"
 
-  curl -s -o /dev/null -w "result_status=%{http_code}\n" "http://localhost:9000/cap-v2/${RESULT_KEY}"
-  curl -s -o /dev/null -w "thumb_status=%{http_code}\n" "http://localhost:9000/cap-v2/${THUMB_KEY}"
+  curl -s -o /dev/null -w "result_status=%{http_code}\n" "http://localhost:8922/cap3/${RESULT_KEY}"
+  curl -s -o /dev/null -w "thumb_status=%{http_code}\n" "http://localhost:8922/cap3/${THUMB_KEY}"
 done
 docker compose ps
 ```
@@ -132,7 +132,7 @@ Milestone 2 proves real FFmpeg processing and MinIO object I/O in Docker end-to-
 
 ## Milestone 3 UI smoke test
 ```bash
-cd /Users/m17/2026/gh_repo_tests/Cap_v2
+cd /Users/m17/2026/gh_repo_tests/cap3
 make down
 make up
 make reset-db
@@ -144,11 +144,13 @@ make reset-db
 4. Confirm both download links are shown (`result.mp4` and `thumbnail.jpg`).
 
 ## Milestone 4 UI (record -> upload -> process -> view)
-The frontend now runs as a dedicated app at `http://localhost:5173` (`apps/web`, Vite + React + TypeScript + Tailwind) and uses existing API endpoints only for upload and processing.
+The Docker-first UI is served via nginx at `http://localhost:8022` (built `apps/web` + `/api` proxy to `web-api`).
+
+Optional frontend dev mode: run `pnpm dev:web` (host-side) and open `http://localhost:5173` (Vite dev server + proxy to `http://localhost:3000`).
 
 ### Docker run
 ```bash
-cd /Users/m17/2026/gh_repo_tests/Cap_v2
+cd /Users/m17/2026/gh_repo_tests/cap3
 cp .env.example .env
 make down
 make up
@@ -156,7 +158,7 @@ make reset-db
 ```
 
 ### UI smoke test
-1. Open `http://localhost:5173`.
+1. Open `http://localhost:8022` (or `http://localhost:5173` if using Vite dev mode).
 2. Go to `Record`.
 3. Click `Start recording`, choose a screen/tab/window, allow microphone, speak for 2 seconds.
 4. Click `Stop recording` and confirm local preview playback (audio expected).
