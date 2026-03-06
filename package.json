@@ -5,6 +5,13 @@
   "packageManager": "pnpm@9.12.3",
   "scripts": {
     "build": "pnpm --filter '*' build",
+    "test": "pnpm --filter '*' test",
+    "lint": "pnpm --filter '*' lint",
+    "lint:fix": "pnpm --filter '*' lint:fix",
+    "typecheck": "pnpm --filter '*' typecheck",
+    "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md}\"",
+    "format:check": "prettier --check \"**/*.{ts,tsx,js,jsx,json,md}\"",
+    "db:migrate": "pnpm --filter @cap/db migrate",
     "dev:web-api": "pnpm --filter @cap/web-api dev",
     "dev:web": "pnpm --filter @cap/web dev",
     "dev:worker": "pnpm --filter @cap/worker dev",
@@ -16,7 +23,14 @@
     "smoke": "curl -sS -X POST http://localhost:3000/debug/smoke"
   },
   "devDependencies": {
+    "@eslint/js": "^9.15.0",
     "@types/node": "^25.3.0",
-    "typescript": "^5.6.3"
+    "eslint": "^9.15.0",
+    "eslint-plugin-react": "^7.37.2",
+    "eslint-plugin-react-hooks": "^5.0.0",
+    "globals": "^15.12.0",
+    "prettier": "^3.3.3",
+    "typescript": "^5.6.3",
+    "typescript-eslint": "^8.15.0"
   }
 }
