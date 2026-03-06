@@ -17,7 +17,9 @@
     "@aws-sdk/s3-request-presigner": "^3.997.0",
     "@cap/config": "workspace:*",
     "@cap/db": "workspace:*",
+    "@cap/logger": "workspace:*",
     "fastify": "^4.28.1",
+    "fastify-plugin": "^5.1.0",
     "fastify-raw-body": "4.3.0"
   },
   "devDependencies": {
